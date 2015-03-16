@@ -5,11 +5,20 @@
 #include "mruby/ext/io.h"
 #include "polarssl/entropy.h"
 #include "polarssl/ctr_drbg.h"
+#include "polarssl/cipher.h"
 #include "polarssl/ssl.h"
 #include "polarssl/version.h"
 #include <sys/ioctl.h>
 
 extern struct mrb_data_type mrb_io_type;
+
+typedef struct
+{
+  cipher_context_t *ctx;
+  unsigned char *output;
+  size_t olen;
+  size_t input_length;
+} mrb_cipher_t;
 
 static void mrb_ssl_free(mrb_state *mrb, void *ptr) {
   ssl_context *ssl = ptr;
@@ -19,9 +28,21 @@ static void mrb_ssl_free(mrb_state *mrb, void *ptr) {
   }
 }
 
+static void mrb_cipher_free(mrb_state *mrb, void *ptr)
+{
+ mrb_cipher_t *cipher = ptr;
+
+  if ( cipher->ctx )
+    cipher_free_ctx(cipher->ctx );
+
+  mrb_free( mrb, cipher );
+}
+
+
 static struct mrb_data_type mrb_entropy_type = { "Entropy", mrb_free };
 static struct mrb_data_type mrb_ctr_drbg_type = { "CtrDrbg", mrb_free };
 static struct mrb_data_type mrb_ssl_type = { "SSL", mrb_ssl_free };
+static struct mrb_data_type mrb_cipher_type = { "Cipher", mrb_cipher_free };
 
 static void entropycheck(mrb_state *mrb, mrb_value self, entropy_context **entropyp) {
   entropy_context *entropy;
@@ -281,6 +302,147 @@ static mrb_value mrb_ssl_fileno(mrb_state *mrb, mrb_value self) {
   return mrb_fixnum_value(fd);
 }
 
+#define E_UNSUPPORTED_CIPHER (mrb_class_get_under(mrb,mrb_class_get_under(mrb,mrb_class_get(mrb, "PolarSSL"),"Cipher"),"UnsupportedCipher"))
+#define E_BAD_INPUT_DATA (mrb_class_get_under(mrb,mrb_class_get_under(mrb,mrb_class_get(mrb, "PolarSSL"),"Cipher"),"BadInputData"))
+#define E_CIPHER_ERROR (mrb_class_get_under(mrb,mrb_class_get_under(mrb,mrb_class_get(mrb, "PolarSSL"),"Cipher"), "Error"))
+
+static mrb_value mrb_cipher_initialize( mrb_state *mrb, mrb_value self )
+{
+    mrb_cipher_t *mrb_cipher;
+    mrb_value cipher_type;
+    char *cipher_type_str;
+    const cipher_info_t *cipher_info;
+    int ret;
+
+    mrb_cipher = mrb_malloc( mrb, sizeof(mrb_cipher_t) );
+    memset( mrb_cipher, 0, sizeof( mrb_cipher_t ) );
+
+    mrb_cipher->olen = 0;
+    mrb_cipher->input_length = 0;
+
+    mrb_cipher->ctx = mrb_malloc( mrb, sizeof(cipher_context_t) );
+    memset( mrb_cipher->ctx, 0, sizeof( cipher_context_t ) );
+
+
+
+    mrb_get_args(mrb, "S", &cipher_type);
+    cipher_type_str = RSTRING_PTR(cipher_type);
+
+    cipher_info = cipher_info_from_string( cipher_type_str );
+
+    if (cipher_info == NULL)
+    {
+        mrb_raisef(mrb, E_UNSUPPORTED_CIPHER, "%s is not a supported cipher", cipher_type_str );
+    }
+    else
+    {
+        ret = cipher_init_ctx( mrb_cipher->ctx, cipher_info );
+        if ( ret < 0 )
+            mrb_raisef( mrb, E_CIPHER_ERROR, "PolarSSL error: -0x%x", -ret );
+    }
+
+    return self;
+}
+
+/*
+ *  call-seq: set_iv(iv_val, iv_len_val)
+ *
+ *  Sets the initialization vector for the cipher. An initialization
+ *  vector is used to "randomize" the output ciphertext so attackers cannot
+ *  guess your data based on a partially decrypted data.
+ *
+ *    cipher.set_iv("16byteiv12345678", 16)
+ *
+ *  One option to generate a random initialization vector is by using
+ *  SecureRandom.random_bytes. Store this initialization vector with the
+ *  ciphertext and you'll easily able to decrypt the ciphertext.
+ *
+ */
+static mrb_value mrb_cipher_set_iv(mrb_state *mrb, mrb_value self)
+{
+    mrb_value iv_val;
+    mrb_value iv_len_val;
+    int ret = 0;
+    mrb_cipher_t *mrb_cipher = DATA_PTR(self);
+    unsigned char *iv;
+    size_t iv_len;
+
+    mrb_get_args(mrb, "Si", &iv_val, &iv_len_val);
+    iv = (unsigned char *) RSTRING_PTR(iv_val);
+    iv_len = mrb_fixnum( iv_len_val );
+
+    if ( ( ret = cipher_set_iv( mrb_cipher->ctx, iv, iv_len ) ) != 0 )
+        mrb_raisef( mrb, E_CIPHER_ERROR, "Failed to set IV. PolarSSL error: -0x%x", -ret );
+
+    return mrb_true_value();
+}
+
+static mrb_value mrb_cipher_reset( mrb_state *mrb, mrb_value self )
+{
+    int ret;
+    mrb_cipher_t *mrb_cipher = DATA_PTR(self);
+
+    if ( ( ret = cipher_reset( mrb_cipher->ctx ) ) != 0 )
+        mrb_raisef( mrb, E_CIPHER_ERROR, "Failed to reset cipher. PolarSSL error: -0x%x", -ret );
+
+    return mrb_true_value();
+}
+
+static mrb_value mrb_cipher_setkey(mrb_state *mrb, mrb_value self )
+{
+    mrb_value key;
+    mrb_value key_length;
+    mrb_value operation;
+    mrb_cipher_t *mrb_cipher = DATA_PTR(self);
+    int ret;
+
+    mrb_get_args(mrb, "Sii", &key, &key_length, &operation);
+
+    ret = cipher_setkey( mrb_cipher->ctx, (const unsigned char *) RSTRING_PTR ( key ), mrb_fixnum( key_length ), mrb_fixnum( operation ) );
+
+    if ( ret < 0 )
+        mrb_raisef( mrb, E_CIPHER_ERROR, "PolarSSL error: -0x%x", -ret );
+
+    return mrb_true_value();
+}
+
+static mrb_value mrb_cipher_update( mrb_state *mrb, mrb_value self )
+{
+  mrb_value mrb_input;
+  mrb_cipher_t *mrb_cipher = DATA_PTR(self);
+  char *input;
+  int ret;
+
+  mrb_get_args(mrb, "S", &mrb_input);
+
+  input = RSTRING_PTR( mrb_input );
+
+  mrb_cipher->input_length += RSTRING_LEN( mrb_input );
+
+  /* Increases the output buffer so it results into the total input length so far. */
+  mrb_realloc(mrb, mrb_cipher->output, mrb_cipher->input_length);
+
+  ret = cipher_update( mrb_cipher->ctx, (const unsigned char *) input, RSTRING_LEN( mrb_input ), mrb_cipher->output, &mrb_cipher->olen );
+
+  if (ret < 0)
+    mrb_raisef( mrb, E_CIPHER_ERROR, "PolarSSL error: -0x%x", -ret );
+
+  return mrb_true_value();
+}
+
+static mrb_value mrb_cipher_finish( mrb_state *mrb, mrb_value self )
+{
+  mrb_cipher_t *mrb_cipher = DATA_PTR(self);
+  int ret;
+
+  ret = cipher_finish( mrb_cipher->ctx, mrb_cipher->output, &mrb_cipher->olen );
+
+  if (ret < 0)
+    mrb_raisef( mrb, E_CIPHER_ERROR, "PolarSSL error: -0x%x", -ret );
+
+  return mrb_str_new_cstr( mrb, mrb_cipher->output );
+}
+
 void mrb_mruby_polarssl_gem_init(mrb_state *mrb) {
   struct RClass *p, *e, *c, *s;
 
@@ -318,6 +480,15 @@ void mrb_mruby_polarssl_gem_init(mrb_state *mrb) {
   mrb_define_method(mrb, s, "fileno", mrb_ssl_fileno, MRB_ARGS_NONE());
   mrb_define_method(mrb, s, "close_notify", mrb_ssl_close_notify, MRB_ARGS_NONE());
   mrb_define_method(mrb, s, "close", mrb_ssl_close, MRB_ARGS_NONE());
+
+  c = mrb_define_class_under(mrb, p, "Cipher", mrb->object_class);
+  MRB_SET_INSTANCE_TT(c, MRB_TT_DATA);
+  mrb_define_method(mrb, c, "initialize", mrb_cipher_initialize, MRB_ARGS_REQ(1));
+  mrb_define_method(mrb, c, "setkey", mrb_cipher_setkey, MRB_ARGS_REQ(3));
+  mrb_define_method(mrb, c, "set_iv", mrb_cipher_set_iv, MRB_ARGS_REQ(2));
+  mrb_define_method(mrb, c, "update", mrb_cipher_update, MRB_ARGS_REQ(1));
+  mrb_define_method(mrb, c, "reset", mrb_cipher_reset, MRB_ARGS_NONE());
+  mrb_define_method(mrb, c, "finish", mrb_cipher_finish, MRB_ARGS_NONE());
 }
 
 void mrb_mruby_polarssl_gem_final(mrb_state *mrb) {
